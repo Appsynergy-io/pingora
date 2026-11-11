@@ -289,6 +289,9 @@ pub struct HttpSession {
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// response.
     pub write_timeout: Option<Duration>,
+    // How long each read of the request body may wait for data. Unset waits as long as the
+    // client keeps the stream open.
+    read_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
 }
@@ -498,6 +501,7 @@ impl HttpSession {
             retry_buffer: None,
             digest,
             write_timeout: None,
+            read_timeout: None,
             total_drain_timeout: None,
         })))
     }
@@ -519,9 +523,24 @@ impl HttpSession {
     }
 
     /// Read request body bytes. `None` when there is no more body to read.
+    ///
+    /// If a read timeout is set, a client that sends no body data for that long fails the read
+    /// with [`ErrorType::ReadTimedout`].
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
+        let read = self.request_body_reader.data();
+        let data = match self.read_timeout {
+            Some(t) => match timeout(t, read).await {
+                Ok(data) => data,
+                Err(_) => {
+                    return Error::e_explain(
+                        ErrorType::ReadTimedout,
+                        format!("reading body, timeout: {t:?}"),
+                    )
+                }
+            },
+            None => read.await,
+        };
+        let data = data.transpose().or_err(
             ErrorType::ReadError,
             "while reading downstream request body",
         )?;
@@ -585,6 +604,17 @@ impl HttpSession {
             },
             None => self.do_drain_request_body().await,
         }
+    }
+
+    /// Sets the downstream read timeout. This will trigger if we're unable
+    /// to read request body data from the stream after `timeout`.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -1812,6 +1842,111 @@ mod test {
         for handle in handles {
             // ensure no panics
             assert!(handle.await.is_ok());
+        }
+    }
+
+    /// Accept one stream whose client sends the request header without ending the stream, then
+    /// sends each of `chunks` after `gap`, ending the body with the last one. The client and the
+    /// server connection stay open until the returned sender is dropped.
+    async fn h2_body_stream(
+        chunks: &'static [&'static str],
+        gap: Duration,
+    ) -> (HttpSession, oneshot::Sender<()>) {
+        let (client, server) = duplex(65536);
+        let (hold_tx, hold_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (_response, mut req_body) = h2.send_request(request, false).unwrap();
+            for (i, chunk) in chunks.iter().enumerate() {
+                tokio::time::sleep(gap).await;
+                req_body.reserve_capacity(chunk.len());
+                req_body
+                    .send_data((*chunk).into(), i + 1 == chunks.len())
+                    .unwrap();
+            }
+            let _ = hold_rx.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let (session_tx, session_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut session_tx = Some(session_tx);
+            while let Ok(Some(accepted)) =
+                HttpSession::from_h2_conn(&mut connection, digest.clone()).await
+            {
+                if let (H2Accept::Session(http), Some(tx)) = (accepted, session_tx.take()) {
+                    let _ = tx.send(http);
+                }
+            }
+        });
+        (session_rx.await.unwrap(), hold_tx)
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_closes_body_stalled_after_headers() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(200);
+        let (http, _hold) = h2_body_stream(&[], Duration::ZERO).await;
+        let mut session = crate::protocols::http::ServerSession::new_http2(http);
+        session.set_read_timeout(Some(READ_TIMEOUT));
+        assert_eq!(session.get_read_timeout(), Some(READ_TIMEOUT));
+
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), session.read_body_or_idle(false))
+            .await
+            .expect("the read timeout should end the read")
+            .expect_err("a stalled body should fail the read");
+        assert_eq!(*err.etype(), ErrorType::ReadTimedout);
+        assert!(start.elapsed() >= READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_no_read_timeout_waits_for_stalled_body() {
+        let (http, _hold) = h2_body_stream(&[], Duration::ZERO).await;
+        assert_eq!(http.get_read_timeout(), None);
+        let session = crate::protocols::http::ServerSession::new_http2(http);
+        assert_eq!(session.get_read_timeout(), None);
+        let crate::protocols::http::ServerSession::H2(mut http) = session else {
+            unreachable!("built from an h2 session")
+        };
+
+        tokio::select! {
+            res = http.read_body_or_idle(false) => panic!("read should wait for the client, got {res:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_spares_body_that_keeps_arriving_and_finishes() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        const CHUNKS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "h"];
+        // Each chunk arrives well within the timeout, the body as a whole takes longer than it.
+        let (mut http, _hold) = h2_body_stream(CHUNKS, Duration::from_millis(50)).await;
+        http.set_read_timeout(Some(READ_TIMEOUT));
+
+        let start = std::time::Instant::now();
+        let mut body = Vec::new();
+        while let Some(data) = http.read_body_bytes().await.unwrap() {
+            body.extend_from_slice(&data);
+        }
+        assert_eq!(body, b"abcdefgh");
+        assert!(start.elapsed() > READ_TIMEOUT);
+        assert!(http.is_body_done());
+
+        // A finished body only watches for the client leaving.
+        tokio::select! {
+            res = http.read_body_or_idle(false) => panic!("a finished body should idle, got {res:?}"),
+            _ = tokio::time::sleep(READ_TIMEOUT * 2) => {}
         }
     }
 
